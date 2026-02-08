@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"os"
 
-	"webgears.org/immich-sync/pkg/app"
-	"webgears.org/immich-sync/pkg/config"
+	"warreth.dev/immich-sync/pkg/app"
+	"warreth.dev/immich-sync/pkg/config"
 )
 
 func main() {

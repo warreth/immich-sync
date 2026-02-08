@@ -46,6 +46,7 @@ Alternatively, you can use a key with "All" permissions.
     "apiKey": "YOUR_IMMICH_API_KEY",
     "apiURL": "http://your-immich-ip:2283/api",
     "debug": false,
+    "workers": 4,
     "syncStartTime": "02:00",
     "googlePhotos": [
         {
@@ -62,13 +63,18 @@ Alternatively, you can use a key with "All" permissions.
 | --- | --- | --- |
 | `apiKey` | string | Immich API Key |
 | `apiURL` | string | Immich API URL (e.g. `http://localhost:2283/api`) |
+| `workers` | int | (Optional) Number of concurrent download/upload workers per album (default: `1`). |
 | `debug` | bool | Enable verbose logging (default: `false` for essential logs only) |
 | `syncStartTime` | string | (Optional) Daily start time in `HH:MM` format. If set, the app waits until this time to run the first sync. |
 | `googlePhotos[].syncInterval` | string | Interval between checks (e.g. `12h`, `60m`). Default `24h`. |
 
 ## Features
 - **Shared Albums**: Syncs photos directly from shared links.
-- **Efficient**: Streaming uploads with minimal resource usage and no disk writes.
+- **Efficient Processing**: Streaming uploads with minimal resource usage.
+- **Concurrent Workers**: Support for parallel downloading/uploading to speed up large albums.
+- **Sequential Syncing**: Processes configured albums one by one to manage load.
+- **Smart Date Detection**: Improved metadata parsing to find the original "taken" date instead of upload date.
+- **Rate Limit Protection**: Built-in jitter and intelligent retry logic to avoid Google Photos rate limits.
 - **Background Sync**: Runs continuously on a schedule.
 
 - **Respects Trash**: Items previously moved to trash in Immich are detected and skipped, not re-uploaded.

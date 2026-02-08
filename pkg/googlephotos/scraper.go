@@ -30,11 +30,7 @@ type Photo struct {
 
 // ScrapeAlbum parses a Google Photos shared album URL and returns the Album structure.
 func ScrapeAlbum(url string) (*Album, error) {
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return nil
-		},
-	}
+	client := NewClient()
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, err
@@ -156,6 +152,19 @@ func ScrapeAlbum(url string) (*Album, error) {
 	}
 
 	var photos []Photo
+
+	extractInt := func(v interface{}) (int64, bool) {
+		switch val := v.(type) {
+		case string:
+			if i, err := strconv.ParseInt(val, 10, 64); err == nil {
+				return i, true
+			}
+		case float64:
+			return int64(val), true
+		}
+		return 0, false
+	}
+
 	for _, item := range list {
 		// Each item is an array
 		// [ID, [URL, w, h], [Timestamp_ms, ...], ...]
@@ -181,31 +190,39 @@ func ScrapeAlbum(url string) (*Album, error) {
 		}
 		
 		// Metadata (Timestamp)
-		// Index 2 is often the array containing timestamp
 		var timestamp time.Time
+		var tsMs int64
+
+		// 1. Check default location (often Upload Date)
 		if len(itemArr) > 2 {
 			if metaArr, ok := itemArr[2].([]interface{}); ok && len(metaArr) > 0 {
-				// The first element is often the timestamp in ms as string or number
-				var tsStr string
-				// Check types
-				switch v := metaArr[0].(type) {
-				case string:
-					tsStr = v
-				case float64:
-					tsStr = fmt.Sprintf("%.0f", v)
+				if t, ok := extractInt(metaArr[0]); ok {
+					tsMs = t
 				}
-				
-				if tsStr != "" {
-					tsMs, err := strconv.ParseInt(tsStr, 10, 64)
-					if err == nil {
-						timestamp = time.UnixMilli(tsMs)
+			}
+		}
+
+		// 2. Check for actual Taken Date in other fields (often index 5 or 6)
+		if len(itemArr) > 5 {
+			for i := 5; i < len(itemArr); i++ {
+				// We look for any array that starts with a plausible timestamp
+				if metaGroup, ok := itemArr[i].([]interface{}); ok && len(metaGroup) > 0 {
+					if t, ok := extractInt(metaGroup[0]); ok {
+						// 1990 check (631152000000)
+						// If we found a timestamp that is older than the default one, prefer it (likely Taken Date vs Upload Date)
+						if t > 631152000000 && (tsMs == 0 || t < tsMs) {
+							tsMs = t
+						}
 					}
 				}
 			}
 		}
+
+		if tsMs > 0 {
+			timestamp = time.UnixMilli(tsMs)
+		}
 		
 		// Description/Caption
-		// Usually at a later index, e.g., index 5 or inside another object.
 		var description string
 		if len(itemArr) > 5 {
 			if d, ok := itemArr[5].(string); ok {
@@ -235,7 +252,14 @@ func ScrapeAlbum(url string) (*Album, error) {
 func DownloadPhotoStream(url string) (io.ReadCloser, int64, error) {
 	// Append =d to get original
 	downloadUrl := url + "=d"
-	resp, err := http.Get(downloadUrl)
+	
+	client := NewClient()
+	req, err := http.NewRequest("GET", downloadUrl, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, 0, err
 	}

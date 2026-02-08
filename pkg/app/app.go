@@ -5,11 +5,12 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
-	"webgears.org/immich-sync/pkg/config"
-	"webgears.org/immich-sync/pkg/googlephotos"
-	"webgears.org/immich-sync/pkg/immich"
+	"warreth.dev/immich-sync/pkg/config"
+	"warreth.dev/immich-sync/pkg/googlephotos"
+	"warreth.dev/immich-sync/pkg/immich"
 )
 
 type App struct {
@@ -60,25 +61,9 @@ func (a *App) Run() {
 		return
 	}
 
-	forever := make(chan struct{})
-
-	for _, ac := range a.Cfg.GooglePhotos {
-		go a.syncLoop(ac)
-	}
-
-	<-forever
-}
-
-func (a *App) syncLoop(ac config.GooglePhotosConfig) {
-	interval, err := time.ParseDuration(ac.SyncInterval)
-	if err != nil || interval == 0 {
-		interval = 24 * time.Hour
-	}
-
 	// Schedule Start Time if configured
 	if a.Cfg.SyncStartTime != "" {
 		now := time.Now()
-		// Try parsing "15:04"
 		parsedTime, err := time.Parse("15:04", a.Cfg.SyncStartTime)
 		if err != nil {
 			a.Logger.Error("Invalid syncStartTime format, expected HH:MM", "error", err)
@@ -92,38 +77,43 @@ func (a *App) syncLoop(ac config.GooglePhotosConfig) {
 			a.Logger.Info("Waiting for scheduled start time", "start_time", a.Cfg.SyncStartTime, "delay", delay.Round(time.Second).String())
 			time.Sleep(delay)
 		}
-	} else {
-		a.Logger.Info("Scheduled sync", "album", ac.URL, "interval", interval.String())
-		// Run immediately if no start time enforced
-		a.runGPhotoSync(ac)
 	}
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	// Initialize schedule
+	nextRun := make(map[string]time.Time)
+	for _, ac := range a.Cfg.GooglePhotos {
+		nextRun[ac.URL] = time.Now()
+	}
 
 	for {
-		// First run if we waited for custom time
-		if a.Cfg.SyncStartTime != "" {
-			a.runGPhotoSync(ac)
+		// Sequential Sync Loop
+		for _, ac := range a.Cfg.GooglePhotos {
+			if time.Now().After(nextRun[ac.URL]) {
+				a.processAlbum(ac)
+				
+				// Schedule next run
+				interval, err := time.ParseDuration(ac.SyncInterval)
+				if err != nil || interval == 0 {
+					interval = 24 * time.Hour
+				}
+				nextRun[ac.URL] = time.Now().Add(interval)
+				a.Logger.Info("Scheduled next sync", "album", ac.URL, "next_run", nextRun[ac.URL].Format("15:04:05"))
+			}
 		}
-		
-		<-ticker.C
-		// If starttime was not set, this is just normal periodic loop
-		// If starttime was set, subsequent ticks happen at 'interval' from the first run.
-		if a.Cfg.SyncStartTime == "" {
-			a.Logger.Info("Starting scheduled sync check", "album", ac.URL)
-			a.runGPhotoSync(ac)
-		} else {
-			// Logic: The ticker fires AFTER interval. 
-			// If we just ran "manually" before the loop due to sleep, we should verify logic.
-			// Actually, standard Ticker behavior works well: `Tick at T+Interval`. 
-			// So if we slept until 02:00 and ran, the ticker created then (or reset? no we need to create it after invalidating drift?)
-			// Creating ticker AFTER the sleep ensures alignment.
-		}
+
+		// Wait before checking again
+		time.Sleep(1 * time.Minute)
 	}
 }
 
-func (a *App) runGPhotoSync(ac config.GooglePhotosConfig) {
+type processResult struct {
+	ID          string
+	WasUploaded bool
+	Error       error
+}
+
+
+func (a *App) processAlbum(ac config.GooglePhotosConfig) {
 	logger := a.Logger.With("album_url", ac.URL)
 	logger.Info("Syncing Google Photos Album")
 
@@ -172,25 +162,53 @@ func (a *App) runGPhotoSync(ac config.GooglePhotosConfig) {
 	added := 0
 	failed := 0
 
-	a.Logger.Info("Processing photos", "total_items", total)
+	// Worker Pool Setup
+	numWorkers := a.Cfg.Workers
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+	if numWorkers > len(album.Photos) {
+		numWorkers = len(album.Photos)
+	}
+	if numWorkers == 0 { numWorkers = 1 }
+
+	logger.Info("Processing photos", "total_items", total, "workers", numWorkers)
+
+	jobs := make(chan googlephotos.Photo, len(album.Photos))
+	results := make(chan processResult, len(album.Photos))
+	var wg sync.WaitGroup
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for p := range jobs {
+				id, uploaded, err := a.processPhoto(p, albumTitle, ac.URL)
+				results <- processResult{ID: id, WasUploaded: uploaded, Error: err}
+			}
+		}()
+	}
 
 	for _, p := range album.Photos {
+		jobs <- p
+	}
+	close(jobs)
+
+	wg.Wait()
+	close(results)
+
+	for res := range results {
 		processed++
-		id, wasUploaded, err := a.processPhoto(p, album.Title, ac.URL)
-		if err != nil {
-			a.Logger.Error("Failed to process photo", "id", p.ID, "error", err)
+		if res.Error != nil {
+			a.Logger.Error("Failed to process photo", "error", res.Error)
 			failed++
-		}
-		if id != "" {
-			if wasUploaded {
+		} else {
+			if res.WasUploaded {
 				added++
 			}
-			newAssetIds = append(newAssetIds, id)
-		}
-
-		// Progress
-		if total > 0 && (processed%10 == 0 || processed == total) {
-			a.Logger.Info("Progress", "processed", processed, "total", total, "failed", failed)
+			if res.ID != "" {
+				newAssetIds = append(newAssetIds, res.ID)
+			}
 		}
 	}
 

@@ -2,6 +2,11 @@ name: Build and Publish Docker Image
 
 on:
     workflow_dispatch:
+        inputs:
+            version:
+                description: "Docker Tag Version"
+                required: true
+                type: string
 
 env:
     REGISTRY: ghcr.io
@@ -33,6 +38,7 @@ jobs:
                   tags: |
                       type=raw,value=latest
                       type=sha
+                      type=raw,value=${{ inputs.version }}
 
             - name: Build and push Docker image
               uses: docker/build-push-action@v5

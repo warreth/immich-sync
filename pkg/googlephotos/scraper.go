@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -166,18 +165,18 @@ func ScrapeAlbum(url string) (*Album, error) {
 	}, nil
 }
 
-func DownloadPhoto(url string) ([]byte, error) {
+func DownloadPhotoStream(url string) (io.ReadCloser, int64, error) {
 	// Append =d to get original
 	downloadUrl := url + "=d"
 	resp, err := http.Get(downloadUrl)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	defer resp.Body.Close()
 	
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("failed to download photo: %d", resp.StatusCode)
+		resp.Body.Close()
+		return nil, 0, fmt.Errorf("failed to download photo: %d", resp.StatusCode)
 	}
 	
-	return io.ReadAll(resp.Body)
+	return resp.Body, resp.ContentLength, nil
 }

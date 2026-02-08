@@ -2,16 +2,38 @@
 
 Sync photos from Google Photos Shared Albums to your Immich instance.
 
-## Features
-- **Shared Albums**: Syncs photos directly from `https://photos.app.goo.gl/...` shared links.
-- **Background Sync**: Runs continuously to keep albums up-to-date (configurable interval).
-- **Metadata**: Preserves creation timestamps (extracted from Google Photos metadata).
-- **Auto-Album**: Automatically creates albums in Immich with the same name as Google Photos (or custom name).
-- **Efficient**: Skips already synced photos.
+## Quick Start (Docker)
 
-## Configuration
+1. **Download**
+   ```bash
+   git clone https://github.com/webgears/immich-sync
+   cd immich-sync
+   ```
 
-Create a `config.json` in the root directory:
+2. **Configure**
+   Copy `config.example.json` to `config.json` and add your Immich details and Google Photos links.
+   ```bash
+   cp config.example.json config.json
+   nano config.json
+   ```
+
+3. **Run**
+   ```bash
+   docker-compose up -d
+   ```
+
+## Configuration (`config.json`)
+
+### API Permissions
+If you are generating a specific API key for this tool, ensure it has the following permissions:
+- `user.read`
+- `asset.read`
+- `asset.create`
+- `album.read`
+- `album.create`
+- `album.update`
+
+Alternatively, you can use a key with "All" permissions.
 
 ```json
 {
@@ -22,35 +44,18 @@ Create a `config.json` in the root directory:
             "url": "https://photos.app.goo.gl/YourAlbumLink1",
             "syncInterval": "12h",
             "albumName": "Vacation 2023"
-        },
-        {
-            "url": "https://photos.app.goo.gl/YourAlbumLink2",
-            "syncInterval": "60m"
-            // "albumName" omitted -> uses Google Photos album title
         }
     ]
 }
 ```
 
-## Running
+## Features
+- **Shared Albums**: Syncs photos directly from shared links.
+- **Efficient**: Streaming uploads with minimal resource usage and no disk writes.
+- **Background Sync**: Runs continuously on a schedule.
 
-1.  **Install Go**: [https://go.dev/doc/install](https://go.dev/doc/install)
-2.  **Run**:
-    ```bash
-    go run main.go
-    ```
-    Or build and run:
-    ```bash
-    go build -o immich-sync
-    ./immich-sync
-    ```
+## Manual Run (Dev)
 
-## Environment Variables
-Alternatively, you can provide Immich credentials via environment variables:
-- `IMMICH_API_KEY`
-- `IMMICH_API_URL`
-
-*Note: Google Photos URLs must be configured in `config.json`.*
-
-## License
-MIT
+```bash
+go run main.go
+```

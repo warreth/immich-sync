@@ -198,6 +198,86 @@ func (c *Client) UploadAsset(filePath string, createdAt time.Time) (string, erro
 	return "", nil 
 }
 
+func (c *Client) requestWithReader(method string, path string, bodyReader io.Reader, contentType string) ([]byte, error) {
+	url := fmt.Sprintf("%s/%s", c.APIURL, path)
+
+	req, err := http.NewRequest(method, url, bodyReader)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Accept", "application/json")
+	if contentType != "" {
+		req.Header.Add("Content-Type", contentType)
+	} else {
+		req.Header.Add("Content-Type", "application/json")
+	}
+	req.Header.Add("x-api-key", c.APIKey)
+
+	res, err := c.Client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if res.StatusCode >= 400 {
+		return body, fmt.Errorf("API error: %s - %s", res.Status, string(body))
+	}
+
+	return body, nil
+}
+
+func (c *Client) UploadAssetStream(reader io.Reader, filename string, size int64, createdAt time.Time) (string, error) {
+	pr, pw := io.Pipe()
+	multipartWriter := multipart.NewWriter(pw)
+
+	go func() {
+		defer pw.Close()
+		defer multipartWriter.Close()
+		
+		// Metadata fields
+		_ = multipartWriter.WriteField("deviceAssetId", fmt.Sprintf("%s-%d", filename, size))
+		_ = multipartWriter.WriteField("deviceId", "immich-sync-go")
+		
+		creationTime := time.Now()
+		if !createdAt.IsZero() {
+			creationTime = createdAt
+		}
+		
+		_ = multipartWriter.WriteField("fileCreatedAt", creationTime.Format(time.RFC3339))
+		_ = multipartWriter.WriteField("fileModifiedAt", creationTime.Format(time.RFC3339))
+		_ = multipartWriter.WriteField("isFavorite", "false")
+
+		part, err := multipartWriter.CreateFormFile("assetData", filename)
+		if err != nil {
+			return
+		}
+		if _, err := io.Copy(part, reader); err != nil {
+			return
+		}
+	}()
+
+	resp, err := c.requestWithReader("POST", "assets", pr, multipartWriter.FormDataContentType())
+	if err != nil {
+		return "", err
+	}
+	
+	var res map[string]interface{}
+	json.Unmarshal(resp, &res)
+	if id, ok := res["id"].(string); ok {
+		return id, nil
+	}
+    if dup, ok := res["duplicate"].(bool); ok && dup {
+         return res["id"].(string), nil
+    }
+	return "", nil 
+}
+
 func (c *Client) GetUser() (string, string, error) {
     body, err := c.request("GET", "users/me", nil, "")
     if err != nil {

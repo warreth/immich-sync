@@ -17,6 +17,7 @@ type ImmichAsset struct {
 	OriginalFileName string `json:"originalFileName"`
 	OriginalMimeType string `json:"originalMimeType"`
 	FileCreatedAt    string `json:"fileCreatedAt"`
+	IsTrashed        bool   `json:"isTrashed"`
 }
 
 type ImmichAssetResponse struct {
@@ -113,6 +114,12 @@ func (c *Client) CreateAlbum(name string) (*Album, error) {
 	}
 	var album Album
 	err = json.Unmarshal(body, &album)
+	if err != nil {
+		return nil, err
+	}
+	if album.Id == "" {
+		return nil, fmt.Errorf("created album has no ID (response: %s)", string(body))
+	}
 	return &album, err
 }
 
@@ -137,7 +144,7 @@ func (c *Client) AddAssetsToAlbum(albumId string, assetIds []string) error {
 
 func (c *Client) SearchAssets(filename string) ([]ImmichAsset, error) {
 	// Simple search by filename
-	payload := map[string]string{"originalFileName": filename}
+	payload := map[string]interface{}{"originalFileName": filename}
 	jsonPayload, _ := json.Marshal(payload)
 	body, err := c.request("POST", "search/metadata", jsonPayload, "")
 	if err != nil {
@@ -233,11 +240,16 @@ func (c *Client) UploadAssetStream(reader io.Reader, filename string, size int64
 		return id, isDup, nil
 	}
     
-    // Sometimes duplicate comes without id in main body if errored? 
+    // Check for error/message in body if ID is missing but status was 2xx
+	// Sometimes duplicate comes without id in main body if errored? 
     // Usually immich returns 200/201 with id.
-    
-	return "", false, nil 
+	if msg, ok := res["message"].(string); ok {
+		return "", false, fmt.Errorf("upload failed with message: %s", msg)
+	}
+
+	return "", false, fmt.Errorf("upload successful but no ID returned (response: %s)", string(resp))
 }
+
 
 func (c *Client) GetUser() (string, string, error) {
     body, err := c.request("GET", "users/me", nil, "")
@@ -251,3 +263,6 @@ func (c *Client) GetUser() (string, string, error) {
     err = json.Unmarshal(body, &user)
     return user.Id, user.Name, err
 }
+
+
+

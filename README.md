@@ -20,6 +20,8 @@ Sync photos from Google Photos Shared Albums to your Immich instance.
        volumes:
          - ./config.json:/app/config.json
    ```
+   
+   > **Note:** You can also configure using environment variables (e.g. `IMMICH_API_KEY`) if you prefer not to mount a config file.
 
    Then run:
    ```bash
@@ -62,7 +64,6 @@ Alternatively, you can use a key with "All" permissions.
 | `apiURL` | string | Immich API URL (e.g. `http://localhost:2283/api`) |
 | `debug` | bool | Enable verbose logging (default: `false` for essential logs only) |
 | `syncStartTime` | string | (Optional) Daily start time in `HH:MM` format. If set, the app waits until this time to run the first sync. |
-| `googlePhotos` | array | List of albums to sync |
 | `googlePhotos[].syncInterval` | string | Interval between checks (e.g. `12h`, `60m`). Default `24h`. |
 
 ## Features
@@ -70,6 +71,7 @@ Alternatively, you can use a key with "All" permissions.
 - **Efficient**: Streaming uploads with minimal resource usage and no disk writes.
 - **Background Sync**: Runs continuously on a schedule.
 
+- **Respects Trash**: Items previously moved to trash in Immich are detected and skipped, not re-uploaded.
 ## Manual Run (Dev)
 
 ```bash

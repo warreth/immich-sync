@@ -25,6 +25,16 @@ func New(cfg *config.Config) (*App, error) {
 	}
 	opts := &slog.HandlerOptions{
 		Level: level,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.LevelKey {
+				return slog.Attr{}
+			}
+			if a.Key == slog.TimeKey {
+				t := a.Value.Time()
+				return slog.String(slog.TimeKey, t.Format("15:04:05"))
+			}
+			return a
+		},
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, opts))
 	client := immich.NewClient(cfg.ApiURL, cfg.ApiKey)
@@ -161,87 +171,31 @@ func (a *App) runGPhotoSync(ac config.GooglePhotosConfig) {
 	processed := 0
 	added := 0
 	failed := 0
-	startTime := time.Now()
 
 	a.Logger.Info("Processing photos", "total_items", total)
 
 	for _, p := range album.Photos {
 		processed++
-		
-		// Create a deterministic filename
-		safeId := strings.ReplaceAll(p.ID, "/", "_")
-		safeId = strings.ReplaceAll(safeId, ":", "_")
-		fakeFilename := fmt.Sprintf("gp_%s.jpg", safeId)
-
-		// Search in Immich
-		exists, _ := a.Client.SearchAssets(fakeFilename)
-		if len(exists) > 0 {
-			// Found it.
-			newAssetIds = append(newAssetIds, exists[0].Id)
-			a.Logger.Debug("Asset already exists locally", "id", exists[0].Id)
-			// Logic continue...
-		} else {
-			// Download logic...
-			a.Logger.Debug("Downloading new photo", "id", safeId)
-			
-			// Use Streaming Download & Upload
-			r, size, err := googlephotos.DownloadPhotoStream(p.URL)
-			if err != nil {
-				a.Logger.Error("Error downloading photo", "id", safeId, "error", err)
-				failed++
-				goto ProgressCheck
+		id, wasUploaded, err := a.processPhoto(p, album.Title, ac.URL)
+		if err != nil {
+			a.Logger.Error("Failed to process photo", "id", p.ID, "error", err)
+			failed++
+		}
+		if id != "" {
+			if wasUploaded {
+				added++
 			}
-
-			// Build Description
-			description := p.Description
-			if p.Uploader != "" {
-				if description != "" {
-					description += "\n\n"
-				}
-				description += fmt.Sprintf("Shared by: %s", p.Uploader)
-			}
-			
-			sep := "\n"
-			if description != "" {
-				sep = "\n\n"
-			}
-			description += fmt.Sprintf("%sSource Album: %s (%s)", sep, album.Title, ac.URL)
-
-			// Upload with metadata
-	        // Note: size is int64, which is correct for UploadAssetStream
-			uploadedId, isDup, err := a.Client.UploadAssetStream(r, fakeFilename, size, p.TakenAt, description)
-			r.Close() // Close response body
-			
-			if err != nil {
-				a.Logger.Error("Error uploading photo", "filename", fakeFilename, "error", err)
-				failed++
-				goto ProgressCheck
-			}
-
-			if uploadedId != "" {
-				if isDup {
-					a.Logger.Debug("Photo already exists (deduplicated)", "filename", fakeFilename, "id", uploadedId)
-				} else {
-					a.Logger.Debug("Uploaded photo", "filename", fakeFilename, "id", uploadedId)
-					added++
-				}
-				newAssetIds = append(newAssetIds, uploadedId)
-			}
+			newAssetIds = append(newAssetIds, id)
 		}
 
-	ProgressCheck:
-		// Progress update every 10 items or 10%
+		// Progress
 		if total > 0 && (processed%10 == 0 || processed == total) {
-			elapsed := time.Since(startTime)
-			rate := float64(processed) / elapsed.Seconds()
-			remaining := total - processed
-			eta := time.Duration(float64(remaining)/rate) * time.Second
-			a.Logger.Info("Progress", "processed", processed, "total", total, "eta", eta.Round(time.Second).String(), "failed", failed)
+			a.Logger.Info("Progress", "processed", processed, "total", total, "failed", failed)
 		}
 	}
 
 	if albumId != "" && len(newAssetIds) > 0 {
-		a.Logger.Info("Adding items to album", "count", len(newAssetIds), "album", albumTitle)
+		a.Logger.Info("Add items to album", "count", len(newAssetIds), "album", albumTitle)
 		err := a.Client.AddAssetsToAlbum(albumId, newAssetIds)
 		if err != nil {
 			a.Logger.Error("Error adding assets to album", "error", err)
@@ -249,3 +203,65 @@ func (a *App) runGPhotoSync(ac config.GooglePhotosConfig) {
 	}
 	a.Logger.Info("Sync finished", "title", albumTitle, "added", added, "failed", failed, "total_processed", processed)
 }
+
+func (a *App) processPhoto(p googlephotos.Photo, albumTitle, albumURL string) (string, bool, error) {
+	// Returns: id, wasUploaded, error
+	
+	// Create a deterministic filename
+	safeId := strings.ReplaceAll(p.ID, "/", "_")
+	safeId = strings.ReplaceAll(safeId, ":", "_")
+	fakeFilename := fmt.Sprintf("gp_%s.jpg", safeId)
+
+	// 1. Search in Immich (Normal)
+	exists, _ := a.Client.SearchAssets(fakeFilename)
+	
+	if len(exists) > 0 {
+		existingID := exists[0].Id
+		a.Logger.Debug("Asset already exists", "id", existingID)
+		return existingID, false, nil
+	}
+
+	// 2. Not Found -> Download & Upload
+	a.Logger.Debug("Downloading new photo", "id", safeId)
+
+	r, size, err := googlephotos.DownloadPhotoStream(p.URL)
+	if err != nil {
+		return "", false, fmt.Errorf("error downloading photo: %w", err)
+	}
+	
+	// Build Description
+	description := p.Description
+	if p.Uploader != "" {
+		if description != "" {
+			description += "\n\n"
+		}
+		description += fmt.Sprintf("Shared by: %s", p.Uploader)
+	}
+
+	sep := "\n"
+	if description != "" {
+		sep = "\n\n"
+	}
+	description += fmt.Sprintf("%sSource Album: %s (%s)", sep, albumTitle, albumURL)
+
+	uploadedId, isDup, err := a.Client.UploadAssetStream(r, fakeFilename, size, p.TakenAt, description)
+	r.Close()
+	
+	if err != nil {
+		return "", false, fmt.Errorf("error uploading photo: %w", err)
+	}
+	
+	if uploadedId == "" {
+		return "", false, fmt.Errorf("upload returned empty ID without error")
+	}
+
+	if isDup {
+		// Duplicate found during upload
+		a.Logger.Debug("Photo already exists (deduplicated)", "filename", fakeFilename, "id", uploadedId)
+		return uploadedId, false, nil
+	} else {
+		a.Logger.Debug("Uploaded photo", "filename", fakeFilename, "id", uploadedId)
+		return uploadedId, true, nil
+	}
+}
+

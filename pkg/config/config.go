@@ -35,8 +35,8 @@ func ReadConfig(path string) (*Config, error) {
 			}
 			
 			return &Config{
-				ApiKey:      apiKey,
-				ApiURL:      apiURL,
+				ApiKey: apiKey,
+				ApiURL: apiURL,
 			}, nil
 		}
 		return nil, err

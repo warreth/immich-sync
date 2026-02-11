@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -30,8 +31,9 @@ type Photo struct {
 }
 
 // ScrapeAlbum parses a Google Photos shared album URL and returns the Album structure.
-func ScrapeAlbum(client *Client, url string) (*Album, error) {
-	resp, err := client.Get(url)
+// Handles pagination automatically for albums with more than ~300 items.
+func ScrapeAlbum(client *Client, albumURL string) (*Album, error) {
+	resp, err := client.Get(albumURL)
 	if err != nil {
 		return nil, err
 	}
@@ -39,6 +41,12 @@ func ScrapeAlbum(client *Client, url string) (*Album, error) {
 
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("failed to fetch album: %d", resp.StatusCode)
+	}
+
+	// Capture final URL after redirects (short URLs like photos.app.goo.gl redirect to photos.google.com)
+	finalURL := albumURL
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL.String()
 	}
 
 	bodyBytes, err := io.ReadAll(resp.Body)
@@ -151,48 +159,138 @@ func ScrapeAlbum(client *Client, url string) (*Album, error) {
 		}
 	}
 
-	var photos []Photo
+	// Parse initial batch of items from embedded page data
+	photos := parsePhotoItems(list)
 
-	extractInt := func(v interface{}) (int64, bool) {
-		switch val := v.(type) {
-		case string:
-			if i, err := strconv.ParseInt(val, 10, 64); err == nil {
-				return i, true
-			}
-		case float64:
-			return int64(val), true
+	// Extract pagination tokens for fetching remaining album items
+	wiz := extractWizTokens(htmlContent)
+	var continueToken string
+	// Primary: continuation token is at data[2]
+	if len(data) > 2 {
+		if tok, ok := data[2].(string); ok && tok != "" {
+			continueToken = tok
 		}
-		return 0, false
+	}
+	// Fallback: scan all top-level string elements after the item list for a long token-like string
+	if continueToken == "" {
+		for i := 2; i < len(data); i++ {
+			if tok, ok := data[i].(string); ok && len(tok) > 10 {
+				continueToken = tok
+				break
+			}
+		}
 	}
 
+	// Paginate through remaining pages via batchexecute API
+	// Note: wiz.AT (SNlM0e CSRF token) is NOT present on public shared album pages
+	// batchexecute works without it for public albums
+	if continueToken != "" {
+		sourcePath, mediaKey := extractAlbumPath(finalURL)
+		authKey := extractAuthKeyFromURL(finalURL)
+
+		// Fallback: extract mediaKey from embedded album metadata at data[3][0]
+		if mediaKey == "" && len(data) > 3 {
+			if meta, ok := data[3].([]interface{}); ok && len(meta) > 0 {
+				if key, ok := meta[0].(string); ok && key != "" {
+					mediaKey = key
+				}
+			}
+		}
+
+		// Fallback: extract authKey from embedded album metadata at data[3][19]
+		if authKey == "" && len(data) > 3 {
+			if meta, ok := data[3].([]interface{}); ok && len(meta) > 19 {
+				if key, ok := meta[19].(string); ok {
+					authKey = key
+				}
+			}
+		}
+
+		if mediaKey != "" {
+			fmt.Printf("  Album has continuation token, fetching remaining items (have %d so far)...\n", len(photos))
+			const maxPages = 500
+			for page := 0; page < maxPages && continueToken != ""; page++ {
+				fmt.Printf("  Fetching page %d (total items so far: %d)...\n", page+2, len(photos))
+				nextPhotos, nextToken, fetchErr := fetchNextPage(client, mediaKey, authKey, continueToken, sourcePath, wiz)
+				if fetchErr != nil {
+					fmt.Printf("  Warning: pagination stopped at page %d: %v\n", page+2, fetchErr)
+					break
+				}
+				if len(nextPhotos) == 0 {
+					break
+				}
+				photos = append(photos, nextPhotos...)
+				continueToken = nextToken
+			}
+		} else {
+			fmt.Printf("  Warning: could not determine album mediaKey, pagination skipped\n")
+		}
+	}
+
+	// Remove duplicate photos from overlapping pages
+	photos = deduplicatePhotos(photos)
+
+	return &Album{
+		ID:     finalURL,
+		Title:  title,
+		Photos: photos,
+	}, nil
+}
+
+// extractInt converts interface{} values to int64 (handles JSON string and float64)
+func extractInt(v interface{}) (int64, bool) {
+	switch val := v.(type) {
+	case string:
+		if i, err := strconv.ParseInt(val, 10, 64); err == nil {
+			return i, true
+		}
+	case float64:
+		return int64(val), true
+	}
+	return 0, false
+}
+
+// normalizeTimestamp converts timestamps in various epoch units to milliseconds
+func normalizeTimestamp(t int64) int64 {
+	if t > 1e15 {
+		return t / 1000 // microseconds to milliseconds
+	}
+	if t > 0 && t < 1e10 {
+		return t * 1000 // seconds to milliseconds
+	}
+	return t
+}
+
+// parsePhotoItems extracts Photo structs from a list of raw scraped item arrays
+func parsePhotoItems(list []interface{}) []Photo {
+	var photos []Photo
 	for _, item := range list {
-		// Each item is an array
-		// [ID, [URL, w, h], [Timestamp_ms, ...], ...]
 		itemArr, ok := item.([]interface{})
 		if !ok || len(itemArr) < 2 {
 			continue
 		}
-		
+
 		id, _ := itemArr[0].(string)
-		
-		// Media Info
+
 		mediaArr, ok := itemArr[1].([]interface{})
 		if !ok || len(mediaArr) < 1 {
 			continue
 		}
-		
-		url, _ := mediaArr[0].(string)
+
+		photoURL, _ := mediaArr[0].(string)
 		w := 0
 		h := 0
 		if len(mediaArr) >= 3 {
-			if fw, ok := mediaArr[1].(float64); ok { w = int(fw) }
-			if fh, ok := mediaArr[2].(float64); ok { h = int(fh) }
+			if fw, ok := mediaArr[1].(float64); ok {
+				w = int(fw)
+			}
+			if fh, ok := mediaArr[2].(float64); ok {
+				h = int(fh)
+			}
 		}
-		
-		// Extract timestamp with improved logic
-		timestamp := extractTimestamp(itemArr, extractInt)
 
-		// Description/Caption
+		timestamp := extractTimestamp(itemArr)
+
 		var description string
 		for i := 3; i < len(itemArr); i++ {
 			if d, ok := itemArr[i].(string); ok && d != "" {
@@ -201,10 +299,10 @@ func ScrapeAlbum(client *Client, url string) (*Album, error) {
 			}
 		}
 
-		if url != "" {
+		if photoURL != "" {
 			photos = append(photos, Photo{
 				ID:          id,
-				URL:         url,
+				URL:         photoURL,
 				Width:       w,
 				Height:      h,
 				TakenAt:     timestamp,
@@ -213,15 +311,204 @@ func ScrapeAlbum(client *Client, url string) (*Album, error) {
 		}
 	}
 
-	return &Album{
-		ID:     url, // Use URL as ID
-		Title:  title,
-		Photos: photos,
-	}, nil
+	return photos
+}
+
+// wizTokens holds Google session tokens needed for pagination requests
+type wizTokens struct {
+	AT   string // CSRF token (SNlM0e)
+	SID  string // Session ID (FdrFJe)
+	BL   string // Build label (cfb2h)
+	Path string // URL path prefix (eptZe), typically "/_/PhotosUi/"
+}
+
+// extractWizTokens parses WIZ_global_data tokens from page HTML for batchexecute requests
+func extractWizTokens(htmlContent string) wizTokens {
+	var tokens wizTokens
+	if m := regexp.MustCompile(`"SNlM0e":"([^"]+)"`).FindStringSubmatch(htmlContent); len(m) > 1 {
+		tokens.AT = m[1]
+	}
+	if m := regexp.MustCompile(`"FdrFJe":"([^"]+)"`).FindStringSubmatch(htmlContent); len(m) > 1 {
+		tokens.SID = m[1]
+	}
+	if m := regexp.MustCompile(`"cfb2h":"([^"]+)"`).FindStringSubmatch(htmlContent); len(m) > 1 {
+		tokens.BL = m[1]
+	}
+	if m := regexp.MustCompile(`"eptZe":"([^"]+)"`).FindStringSubmatch(htmlContent); len(m) > 1 {
+		tokens.Path = m[1]
+	}
+	if tokens.Path == "" {
+		tokens.Path = "/_/PhotosUi/"
+	}
+	return tokens
+}
+
+// extractAlbumPath returns the source-path and album media key from a shared album URL
+func extractAlbumPath(rawURL string) (string, string) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", ""
+	}
+
+	sourcePath := u.Path
+	if u.RawQuery != "" {
+		sourcePath += "?" + u.RawQuery
+	}
+
+	// Extract media key from path: /share/<mediaKey>
+	parts := strings.Split(strings.TrimRight(u.Path, "/"), "/")
+	mediaKey := ""
+	for i, p := range parts {
+		if p == "share" && i+1 < len(parts) {
+			mediaKey = parts[i+1]
+			break
+		}
+	}
+
+	return sourcePath, mediaKey
+}
+
+// extractAuthKeyFromURL gets the shared album auth key from URL query parameter
+func extractAuthKeyFromURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return u.Query().Get("key")
+}
+
+// fetchNextPage calls Google's internal batchexecute API to get the next page of album items
+func fetchNextPage(client *Client, mediaKey, authKey, pageToken, sourcePath string, wiz wizTokens) ([]Photo, string, error) {
+	// Build the inner request payload
+	innerData := []interface{}{mediaKey, pageToken, nil, authKey}
+	innerJSON, err := json.Marshal(innerData)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to marshal inner request: %w", err)
+	}
+
+	// Wrap in batchexecute envelope
+	outerData := []interface{}{
+		[]interface{}{
+			[]interface{}{"snAcKc", string(innerJSON), nil, "generic"},
+		},
+	}
+	outerJSON, err := json.Marshal(outerData)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to marshal outer request: %w", err)
+	}
+
+	formBody := url.Values{}
+	formBody.Set("f.req", string(outerJSON))
+	// AT (CSRF token) is optional — not present on public shared album pages
+	if wiz.AT != "" {
+		formBody.Set("at", wiz.AT)
+	}
+
+	batchURL := fmt.Sprintf(
+		"https://photos.google.com%sdata/batchexecute?rpcids=snAcKc&source-path=%s&f.sid=%s&bl=%s&pageId=none&rt=c",
+		wiz.Path,
+		url.QueryEscape(sourcePath),
+		url.QueryEscape(wiz.SID),
+		url.QueryEscape(wiz.BL),
+	)
+
+	resp, err := client.Post(batchURL, "application/x-www-form-urlencoded;charset=UTF-8", formBody.Encode())
+	if err != nil {
+		return nil, "", fmt.Errorf("batchexecute request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, "", fmt.Errorf("batchexecute returned status %d", resp.StatusCode)
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read batchexecute response: %w", err)
+	}
+
+	return parseBatchResponse(string(respBody))
+}
+
+// parseBatchResponse parses Google's batchexecute multi-line RPC response format
+func parseBatchResponse(body string) ([]Photo, string, error) {
+	lines := strings.Split(body, "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.Contains(line, "wrb.fr") {
+			continue
+		}
+
+		// Parse the envelope JSON
+		var envelope []interface{}
+		if err := json.Unmarshal([]byte(line), &envelope); err != nil {
+			continue
+		}
+
+		if len(envelope) == 0 {
+			continue
+		}
+
+		respArr, ok := envelope[0].([]interface{})
+		if !ok || len(respArr) < 3 {
+			continue
+		}
+
+		// Verify RPC ID matches our request
+		rpcId, _ := respArr[1].(string)
+		if rpcId != "snAcKc" {
+			continue
+		}
+
+		payloadStr, ok := respArr[2].(string)
+		if !ok || payloadStr == "" {
+			continue
+		}
+
+		// Parse the actual data payload
+		var payload []interface{}
+		if err := json.Unmarshal([]byte(payloadStr), &payload); err != nil {
+			continue
+		}
+
+		// Extract items from payload[1]
+		var photos []Photo
+		if len(payload) > 1 {
+			if items, ok := payload[1].([]interface{}); ok {
+				photos = parsePhotoItems(items)
+			}
+		}
+
+		// Extract continuation token from payload[2]
+		var nextToken string
+		if len(payload) > 2 {
+			if tok, ok := payload[2].(string); ok {
+				nextToken = tok
+			}
+		}
+
+		return photos, nextToken, nil
+	}
+
+	return nil, "", fmt.Errorf("no valid response envelope found in batchexecute response")
+}
+
+// deduplicatePhotos removes duplicate photos based on their ID
+func deduplicatePhotos(photos []Photo) []Photo {
+	seen := make(map[string]bool, len(photos))
+	result := make([]Photo, 0, len(photos))
+	for _, p := range photos {
+		if p.ID != "" && !seen[p.ID] {
+			seen[p.ID] = true
+			result = append(result, p)
+		}
+	}
+	return result
 }
 
 // extractTimestamp extracts the best available timestamp from a scraped item
-func extractTimestamp(itemArr []interface{}, extractInt func(interface{}) (int64, bool)) time.Time {
+func extractTimestamp(itemArr []interface{}) time.Time {
 	now := time.Now()
 	var candidates []int64
 
@@ -229,14 +516,14 @@ func extractTimestamp(itemArr []interface{}, extractInt func(interface{}) (int64
 	for i := 2; i < len(itemArr); i++ {
 		if metaArr, ok := itemArr[i].([]interface{}); ok && len(metaArr) > 0 {
 			if t, ok := extractInt(metaArr[0]); ok {
-				// Must be after 2000-01-01 and not in the future (with 1-day tolerance)
+				t = normalizeTimestamp(t)
 				if t > 946684800000 && time.UnixMilli(t).Before(now.Add(24*time.Hour)) {
 					candidates = append(candidates, t)
 				}
 			}
 		}
-		// Also check direct numeric values at this index
 		if t, ok := extractInt(itemArr[i]); ok {
+			t = normalizeTimestamp(t)
 			if t > 946684800000 && time.UnixMilli(t).Before(now.Add(24*time.Hour)) {
 				candidates = append(candidates, t)
 			}

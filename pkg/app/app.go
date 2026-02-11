@@ -174,7 +174,7 @@ func (a *App) processAlbum(ac config.GooglePhotosConfig, albumCache []immich.Alb
 		}
 	}
 
-	// Pre-fetch existing album assets for O(1) duplicate detection (replaces 6 API calls per photo)
+	// Pre-fetch existing album assets for O(1) duplicate detection
 	existingFiles := make(map[string]string) // baseName (no extension) -> asset ID
 	if albumId != "" {
 		albumDetails, err := a.Client.GetAlbum(albumId)
@@ -188,6 +188,16 @@ func (a *App) processAlbum(ac config.GooglePhotosConfig, albumCache []immich.Alb
 			}
 			logger.Debug("Pre-fetched album assets", "count", len(existingFiles))
 		}
+	}
+
+	// Pre-fetch all assets uploaded by this tool globally for O(1) lookup.
+	// Avoids re-downloading and re-uploading files that exist in Immich but not in this album.
+	globalAssets, err := a.Client.SearchAssetsByDevice("immich-sync-go")
+	if err != nil {
+		logger.Warn("Failed to fetch global assets, will fall back to re-upload for duplicates", "error", err)
+		globalAssets = make(map[string]string)
+	} else {
+		logger.Debug("Pre-fetched global assets from Immich", "count", len(globalAssets))
 	}
 
 	var newAssetIds []string
@@ -221,7 +231,7 @@ func (a *App) processAlbum(ac config.GooglePhotosConfig, albumCache []immich.Alb
 		go func() {
 			defer wg.Done()
 			for p := range jobs {
-				id, uploaded, bytesDown, bytesUp, err := a.processItem(p, albumTitle, ac.URL, existingFiles)
+				id, uploaded, bytesDown, bytesUp, err := a.processItem(p, albumTitle, ac.URL, existingFiles, globalAssets)
 				results <- processResult{ID: id, WasUploaded: uploaded, Error: err, BytesDownloaded: bytesDown, BytesUploaded: bytesUp}
 			}
 		}()
@@ -289,7 +299,7 @@ func (a *App) processAlbum(ac config.GooglePhotosConfig, albumCache []immich.Alb
 	}
 }
 
-func (a *App) processItem(p googlephotos.Photo, albumTitle, albumURL string, existingFiles map[string]string) (string, bool, int64, int64, error) {
+func (a *App) processItem(p googlephotos.Photo, albumTitle, albumURL string, existingFiles map[string]string, globalAssets map[string]string) (string, bool, int64, int64, error) {
 	safeId := strings.ReplaceAll(p.ID, "/", "_")
 	safeId = strings.ReplaceAll(safeId, ":", "_")
 	baseName := fmt.Sprintf("gp_%s", safeId)
@@ -298,6 +308,12 @@ func (a *App) processItem(p googlephotos.Photo, albumTitle, albumURL string, exi
 	if assetId, exists := existingFiles[baseName]; exists {
 		a.Logger.Debug("Asset already in album", "id", assetId, "filename", baseName)
 		return "", false, 0, 0, nil
+	}
+
+	// O(1) check against global Immich assets — avoids re-downloading and re-uploading
+	if assetId, exists := globalAssets[baseName]; exists {
+		a.Logger.Debug("Asset exists in Immich globally, adding to album", "id", assetId, "filename", baseName)
+		return assetId, false, 0, 0, nil
 	}
 
 	if a.Cfg.StrictMetadata && p.TakenAt.IsZero() {

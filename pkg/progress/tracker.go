@@ -79,6 +79,10 @@ func (t *Tracker) Start() {
 	if t.debug {
 		return
 	}
+	if !t.isTTY {
+		fmt.Printf("[%s] Processing %d items (progress updates every %d%%)\n",
+			truncateAlbumName(t.albumName, 20), t.totalItems, nonTTYPercentStep)
+	}
 	go func() {
 		interval := ttyUpdateInterval
 		if !t.isTTY {

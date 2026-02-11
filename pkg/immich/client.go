@@ -218,3 +218,54 @@ func (c *Client) GetUser() (string, string, error) {
 	err = json.Unmarshal(body, &user)
 	return user.Id, user.Name, err
 }
+
+// SearchAssetsByDevice fetches all assets uploaded by the given deviceId using paginated metadata search.
+// Returns a map of originalFileName (without extension) -> asset ID for O(1) lookups.
+func (c *Client) SearchAssetsByDevice(deviceId string) (map[string]string, error) {
+	result := make(map[string]string)
+	page := 1
+	pageSize := 1000
+
+	for {
+		payload := map[string]interface{}{
+			"deviceId": deviceId,
+			"page":     page,
+			"size":     pageSize,
+		}
+		jsonPayload, _ := json.Marshal(payload)
+
+		body, err := c.request("POST", "search/metadata", jsonPayload, "")
+		if err != nil {
+			return result, fmt.Errorf("search metadata failed on page %d: %w", page, err)
+		}
+
+		var searchResp struct {
+			Assets struct {
+				Items []struct {
+					Id               string `json:"id"`
+					OriginalFileName string `json:"originalFileName"`
+				} `json:"items"`
+				NextPage interface{} `json:"nextPage"`
+			} `json:"assets"`
+		}
+		if err := json.Unmarshal(body, &searchResp); err != nil {
+			return result, fmt.Errorf("failed to parse search response: %w", err)
+		}
+
+		for _, asset := range searchResp.Assets.Items {
+			name := asset.OriginalFileName
+			if dot := strings.LastIndex(name, "."); dot != -1 {
+				name = name[:dot]
+			}
+			result[name] = asset.Id
+		}
+
+		// Stop if no more pages
+		if searchResp.Assets.NextPage == nil || len(searchResp.Assets.Items) < pageSize {
+			break
+		}
+		page++
+	}
+
+	return result, nil
+}

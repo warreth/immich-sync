@@ -14,8 +14,8 @@ const userAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, li
 const (
 	maxRetries  = 5
 	baseBackoff = 5 * time.Second
-	minJitter   = 500
-	jitterRange = 1000
+	minJitter   = 100
+	jitterRange = 250
 )
 
 type Client struct {

@@ -259,50 +259,106 @@ func extractTimestamp(itemArr []interface{}, extractInt func(interface{}) (int64
 	return time.UnixMilli(best)
 }
 
-// DownloadMediaStream downloads media from Google Photos, detecting videos vs photos.
-// Uses a HEAD request to probe Content-Type first, then downloads with the correct parameter.
-// Returns: body, size, isVideo, error
-func DownloadMediaStream(baseUrl string, hintIsVideo bool) (io.ReadCloser, int64, bool, error) {
-	client := NewClient()
-	isVideo := false
-
-	// Probe with HEAD request to =dv to check if this item is a video
-	videoUrl := baseUrl + "=dv"
-	probeReq, err := http.NewRequest("HEAD", videoUrl, nil)
-	if err == nil {
-		probeReq.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-		probeResp, probeErr := client.client.Do(probeReq)
-		if probeErr == nil {
-			ct := probeResp.Header.Get("Content-Type")
-			probeResp.Body.Close()
-			if probeResp.StatusCode == 200 && strings.HasPrefix(ct, "video/") {
-				isVideo = true
-			}
+// extensionFromContentType maps Content-Type to file extension
+func extensionFromContentType(contentType string) string {
+	ct := strings.ToLower(strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0]))
+	switch ct {
+	case "image/jpeg":
+		return ".jpg"
+	case "image/png":
+		return ".png"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	case "image/heic", "image/heif":
+		return ".heic"
+	case "image/avif":
+		return ".avif"
+	case "video/mp4":
+		return ".mp4"
+	case "video/webm":
+		return ".webm"
+	case "video/quicktime":
+		return ".mov"
+	case "video/x-matroska":
+		return ".mkv"
+	default:
+		if strings.HasPrefix(ct, "video/") {
+			return ".mp4"
 		}
+		return ".jpg"
 	}
+}
 
-	// Download with the correct parameter
-	var downloadUrl string
-	if isVideo {
-		downloadUrl = baseUrl + "=dv"
-	} else {
-		downloadUrl = baseUrl + "=d"
-	}
+// DownloadMedia downloads media from Google Photos as a plain image or video.
+// For images (including motion photos), uses =w{W}-h{H} to get the pure still image
+// without any embedded video data. For pure videos, uses =dv.
+// Returns: body, size, extension (e.g. ".jpg"), isVideo, error
+func DownloadMedia(baseUrl string, width int, height int) (io.ReadCloser, int64, string, bool, error) {
+	client := NewClient()
 
-	req, err := http.NewRequest("GET", downloadUrl, nil)
+	// First, probe with =d to check if this is a video
+	probeReq, err := http.NewRequest("HEAD", baseUrl+"=d", nil)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, 0, "", false, err
+	}
+	probeReq.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	probeResp, err := client.client.Do(probeReq)
+	if err != nil {
+		return nil, 0, "", false, err
+	}
+	probeCt := probeResp.Header.Get("Content-Type")
+	probeResp.Body.Close()
+
+	// Pure video: download via =dv
+	if strings.HasPrefix(strings.ToLower(probeCt), "video/") {
+		vReq, err := http.NewRequest("GET", baseUrl+"=dv", nil)
+		if err != nil {
+			return nil, 0, "", false, err
+		}
+
+		vResp, err := client.Do(vReq)
+		if err != nil {
+			return nil, 0, "", false, err
+		}
+
+		if vResp.StatusCode != 200 {
+			vResp.Body.Close()
+			return nil, 0, "", false, fmt.Errorf("failed to download video: %d", vResp.StatusCode)
+		}
+
+		vCt := vResp.Header.Get("Content-Type")
+		vExt := extensionFromContentType(vCt)
+		return vResp.Body, vResp.ContentLength, vExt, true, nil
+	}
+
+	// Image (including motion photos): use =w{W}-h{H} to get pure image without embedded video
+	if width <= 0 {
+		width = 16383
+	}
+	if height <= 0 {
+		height = 16383
+	}
+	imgUrl := fmt.Sprintf("%s=w%d-h%d", baseUrl, width, height)
+
+	req, err := http.NewRequest("GET", imgUrl, nil)
+	if err != nil {
+		return nil, 0, "", false, err
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, 0, "", false, err
 	}
 
 	if resp.StatusCode != 200 {
 		resp.Body.Close()
-		return nil, 0, false, fmt.Errorf("failed to download media: %d", resp.StatusCode)
+		return nil, 0, "", false, fmt.Errorf("failed to download image: %d", resp.StatusCode)
 	}
 
-	return resp.Body, resp.ContentLength, isVideo, nil
+	ct := resp.Header.Get("Content-Type")
+	ext := extensionFromContentType(ct)
+	return resp.Body, resp.ContentLength, ext, false, nil
 }

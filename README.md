@@ -84,6 +84,9 @@ Alternatively, you can use a key with "All" permissions.
 - **Rate Limit Protection**: Built-in jitter and intelligent retry logic to avoid Google Photos rate limits.
 - **Background Sync**: Runs continuously on a schedule.
 - **Respects Trash**: Items previously moved to trash in Immich are detected and skipped, not re-uploaded.
+
+> **Note:** Motion/Live photos are imported as plain still images. The embedded video component is stripped so Immich treats them as normal photos without errors.
+
 ## Manual Run (Dev)
 
 ```bash

@@ -223,26 +223,13 @@ func (a *App) processAlbum(ac config.GooglePhotosConfig) {
 }
 
 func (a *App) processItem(p googlephotos.Photo, albumTitle, albumURL string) (string, bool, error) {
-	// Skip videos if configured
-	if p.IsVideo && a.Cfg.SkipVideos {
-		a.Logger.Debug("Skipping video item", "id", p.ID, "url", p.URL)
-		return "", false, nil
-	}
-
-	// Enforce strict metadata: skip items without a valid date
-	if a.Cfg.StrictMetadata && p.TakenAt.IsZero() {
-		a.Logger.Warn("Skipping item with missing metadata date",
-			"id", p.ID, "url", p.URL, "is_video", p.IsVideo)
-		return "", false, nil
-	}
-
 	// Create a deterministic filename base
 	safeId := strings.ReplaceAll(p.ID, "/", "_")
 	safeId = strings.ReplaceAll(safeId, ":", "_")
 	baseName := fmt.Sprintf("gp_%s", safeId)
 
-	// Search in Immich for existing asset (check both photo and video filenames)
-	for _, ext := range []string{".jpg", ".mp4"} {
+	// Search in Immich for existing asset
+	for _, ext := range []string{".jpg", ".png", ".heic", ".mp4", ".mov", ".webp"} {
 		exists, _ := a.Client.SearchAssets(baseName + ext)
 		if len(exists) > 0 {
 			existingID := exists[0].Id
@@ -251,27 +238,28 @@ func (a *App) processItem(p googlephotos.Photo, albumTitle, albumURL string) (st
 		}
 	}
 
-	// Download media (video-aware)
-	a.Logger.Debug("Downloading new item", "id", safeId)
+	// Enforce strict metadata: skip items without a valid date
+	if a.Cfg.StrictMetadata && p.TakenAt.IsZero() {
+		a.Logger.Warn("Skipping item with missing metadata date",
+			"id", p.ID, "url", p.URL)
+		return "", false, nil
+	}
 
-	r, size, isVideo, err := googlephotos.DownloadMediaStream(p.URL, p.IsVideo)
+	// Download media from Google Photos (images are fetched as pure stills)
+	a.Logger.Debug("Downloading item", "id", safeId)
+	r, size, ext, isVideo, err := googlephotos.DownloadMedia(p.URL, p.Width, p.Height)
 	if err != nil {
 		return "", false, fmt.Errorf("error downloading item: %w", err)
 	}
 
-	// Determine filename based on actual media type
-	ext := ".jpg"
-	if isVideo {
-		ext = ".mp4"
-	}
-	filename := baseName + ext
-
-	// Handle skipVideos after download detection
+	// Skip videos if configured
 	if isVideo && a.Cfg.SkipVideos {
 		r.Close()
-		a.Logger.Debug("Skipping detected video item", "id", p.ID)
+		a.Logger.Debug("Skipping video item", "id", p.ID)
 		return "", false, nil
 	}
+
+	filename := baseName + ext
 
 	// Build description
 	description := p.Description
@@ -281,7 +269,6 @@ func (a *App) processItem(p googlephotos.Photo, albumTitle, albumURL string) (st
 		}
 		description += fmt.Sprintf("Shared by: %s", p.Uploader)
 	}
-
 	sep := "\n"
 	if description != "" {
 		sep = "\n\n"
@@ -296,13 +283,11 @@ func (a *App) processItem(p googlephotos.Photo, albumTitle, albumURL string) (st
 
 	uploadedId, isDup, err := a.Client.UploadAssetStream(r, filename, size, p.TakenAt, description)
 	r.Close()
-
 	if err != nil {
-		return "", false, fmt.Errorf("error uploading %s: %w", ext, err)
+		return "", false, fmt.Errorf("error uploading %s: %w", filename, err)
 	}
-
 	if uploadedId == "" {
-		return "", false, fmt.Errorf("upload returned empty ID without error")
+		return "", false, fmt.Errorf("upload returned empty ID for %s", filename)
 	}
 
 	if isDup {
